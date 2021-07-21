@@ -1,0 +1,8 @@
+notebook
+jupytext
+pipdeptree
+when-changed
+pandas
+numpy
+seaborn
+streamlit
