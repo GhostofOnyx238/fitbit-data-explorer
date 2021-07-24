@@ -11,11 +11,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 
-from streamlit.script_runner import RerunException
-from streamlit.state.session_state import SessionState
 
-
-# Client functions
+# CLIENT FUNCTIONS
 def authenticate(client_id:str, client_secret:str):
     server = Oauth2.OAuth2Server(client_id, client_secret)
 
@@ -42,7 +39,25 @@ def display_auth_status(state):
         st.sidebar.warning(f"Not authenticated with Fitbit API.")
 
 
-# Datetime formatting functions
+# FETCH DATA
+@st.cache()
+def get_user_data(client):
+    return client.user_profile_get()["user"]
+
+
+@st.cache()
+def get_sleep_data(client, date):
+    return client.get_sleep(date)
+
+
+@st.cache()
+def get_heart_data(client, date):
+    return client.time_series(resource = 'activities/heart', 
+                              period='1d', 
+                              base_date=date)
+
+
+# FORMATTING FUNCTIONS
 def format_dob(dob):
     return datetime.strftime(datetime.strptime(dob, '%Y-%m-%d'), "%d/%m/%Y")
 
@@ -52,7 +67,6 @@ def format_sleep_time_limits(zoned_datetime):
     return parser.parse(zoned_datetime)
 
 
-# Sleep summary functions
 def format_time_in_stage(time_format:str, time_in_stage:int) -> str:
     return time_format.format(*divmod(time_in_stage, 60))
 
@@ -63,6 +77,108 @@ def calc_percentage(minutes_in_stage:int, minutes_in_bed:int) -> int:
 
 def get_30_day_avg(sleep_stage:str) -> int:
     return sleep_data['sleep'][0]['levels']['summary'][sleep_stage]['thirtyDayAvgMinutes']
+
+
+# PLOTTING FUNCTIONS
+def plot_stage_summary(source:pd.DataFrame):
+    stage_summary_chart = alt.Chart(source).transform_joinaggregate(
+                    TotalTime='sum(Raw Time)',
+                ).transform_calculate(
+                    PercentOfTotal="datum['Raw Time'] / datum.TotalTime"
+                ).mark_bar(size=50).encode(
+                    alt.X('PercentOfTotal:Q',
+                    scale=alt.Scale(domain=(0, 1)),
+                    axis=alt.Axis(format='.0%', title='Percentage of time in stage')),
+                    y='Stage:N'
+                ).properties(
+                    height=300
+                )
+
+    tick = alt.Chart(source).transform_joinaggregate(
+        TotalAverages='sum(Averages)',
+    ).transform_calculate(
+        PercentOfTotalAverages="datum['Averages'] / datum.TotalAverages"
+    ).mark_tick(
+        color='red',
+        thickness=2,
+        size=50 * 1,  # controls width of tick.
+    ).encode(
+        x='PercentOfTotalAverages:Q',
+        y='Stage:N'
+    )
+
+    text = stage_summary_chart.mark_text(
+        align='left',
+        baseline='middle',
+        dx=20
+    ).encode(
+        text="Time in stage:N"
+    )
+
+    st.altair_chart((stage_summary_chart + tick + text), use_container_width=True)
+
+
+def plot_stage_timeseries(source:pd.DataFrame):
+    stage_timeseries_chart = alt.Chart(source
+        ).mark_line(
+        ).encode(
+            alt.X("dateTime:T",
+            axis=alt.Axis(title='Time')),
+            alt.Y("stages:Q",
+            axis=alt.Axis(tickMinStep=1)),
+        )
+
+    # Create a selection that chooses the nearest point & selects based on x-value
+    nearest = alt.selection(type='single', nearest=True, on='mouseover',
+            fields=['dateTime'], empty='none')
+
+    # Transparent selectors across the chart. This is what tells us
+    # the x-value of the cursor
+    selectors = alt.Chart(source).mark_point().encode(
+        x='dateTime:T',
+        opacity=alt.value(0),
+    ).add_selection(
+        nearest
+    )
+
+    # Draw points on the line, and highlight based on selection
+    points = stage_timeseries_chart.mark_point().encode(
+        opacity=alt.condition(nearest, alt.value(1), alt.value(0))
+    )
+
+    # Draw text labels near the points, and highlight based on selection
+    text = stage_timeseries_chart.mark_text(align='left', dx=5, dy=-10).encode(
+        text=alt.condition(nearest, 'hoursminutes(dateTime):T', alt.value(' '))
+    )
+
+    # Draw a rule at the location of the selection
+    rules = alt.Chart(source).mark_rule(color='gray').encode(
+        x='dateTime:T',
+    ).transform_filter(
+        nearest
+    )
+
+    # Put the five layers into a chart and bind the data
+    layers = alt.layer(
+        stage_timeseries_chart, selectors, points, rules, text
+    ).properties(
+        height=300
+    )
+
+    st.altair_chart(layers, use_container_width=True)
+
+
+def plot_heart_timeseries(source:pd.DataFrame):
+    heart_timeseries_chart = alt.Chart(source
+        ).mark_line(
+        ).encode(
+            alt.X("time):T",
+            axis=alt.Axis(title='Time')),
+            alt.Y("value:Q",
+            axis=alt.Axis(title='Heart Rate (bpm)')),
+        )
+    
+    st.altair_chart(heart_timeseries_chart, use_container_width=True)
 
 
 if __name__ == "__main__":
@@ -79,13 +195,14 @@ if __name__ == "__main__":
     st.sidebar.header("Settings")
     st.sidebar.subheader("Authentication Status:")
     display_auth_status(st.session_state.authenticated)
+    st.session_state.date = st.sidebar.date_input("Date")
 
     st.title("Fitbit Data Explorer")
 
     st.header("API Authentication")
 
     st.write("""Start by authenticating with the Fitbit Web API. 
-            If you don't currently have any API credentials, you can obtain them here https://dev.fitbit.com/login""")
+            \nIf you don't have API credentials, you can obtain them here https://dev.fitbit.com/login""")
 
 
     # API Authentication
@@ -112,8 +229,8 @@ if __name__ == "__main__":
         # USER INFORMATION
         st.header("User Information")
         with st.beta_expander("", expanded=False):
-            user_data = st.session_state.client.user_profile_get()["user"]
-            #st.write(user_data)
+            user_data = get_user_data(st.session_state.client)
+
             st.markdown(f"**Name:** {user_data['fullName']}")
             st.markdown(f"**Date of Birth:** {format_dob(user_data['dateOfBirth'])}")
             st.markdown(f"**Age:** {user_data['age']}")
@@ -125,9 +242,7 @@ if __name__ == "__main__":
         st.header("Sleep")
         with st.beta_expander("", expanded=True):
 
-            sleep_date = st.sidebar.date_input("Date")
-
-            sleep_data = st.session_state.client.get_sleep(sleep_date)
+            sleep_data = get_sleep_data(st.session_state.client, st.session_state.date)
 
             if len(sleep_data["sleep"]) == 0:
                 st.warning("No sleep data has been recorded for this day.")
@@ -136,7 +251,7 @@ if __name__ == "__main__":
                 sleep_stages_df = pd.DataFrame(sleep_stages)
                 sleep_summary = sleep_data['summary']
                 
-                # Sleep Stats
+                ## Sleep Stats
                 bed_time = format_sleep_time_limits(sleep_data['sleep'][0]['startTime'])
                 wake_time = format_sleep_time_limits(sleep_data['sleep'][0]['endTime'])
                 sleep_delta = str(wake_time - bed_time - timedelta(minutes=sleep_summary['stages']['wake'])).split(':')
@@ -144,6 +259,7 @@ if __name__ == "__main__":
 
                 st.subheader("Sleep Summary")
                 st.text("")
+
                 sleep_col1, sleep_col2, sleep_col3 = st.beta_columns(3)
 
                 with sleep_col1:
@@ -153,11 +269,10 @@ if __name__ == "__main__":
                 with sleep_col3:
                     st.markdown(f"![Time Asleep](https://img.icons8.com/color/48/000000/bed.png) **Time Asleep:** {time_asleep}")
 
-                # Sleep Stage Summary
+                ## Sleep Stage Summary
                 st.markdown("---")
                 st.subheader("Sleep Stages")
                 st.text("")
-
                 
                 time_format = "{:01d}hrs {:02d}min"
                 stages = ["wake", "rem", "light", "deep"]
@@ -175,46 +290,14 @@ if __name__ == "__main__":
                     'Averages': stage_avgs.values()
                     })
 
-                stage_summary_chart = alt.Chart(stage_summary_df).transform_joinaggregate(
-                    TotalTime='sum(Raw Time)',
-                ).transform_calculate(
-                    PercentOfTotal="datum['Raw Time'] / datum.TotalTime"
-                ).mark_bar(size=40).encode(
-                    alt.X('PercentOfTotal:Q',
-                    scale=alt.Scale(domain=(0, 1)),
-                    axis=alt.Axis(format='.0%', title='Percentage of time in stage')),
-                    y='Stage:N'
-                ).properties(
-                    height=250
-                )
+                plot_stage_summary(stage_summary_df)
 
-                tick = alt.Chart(stage_summary_df).transform_joinaggregate(
-                    TotalAverages='sum(Averages)',
-                ).transform_calculate(
-                    PercentOfTotalAverages="datum['Averages'] / datum.TotalAverages"
-                ).mark_tick(
-                    color='red',
-                    thickness=2,
-                    size=50 * 0.8,  # controls width of tick.
-                ).encode(
-                    x='PercentOfTotalAverages:Q',
-                    y='Stage:N'
-                )
+                ## Sleep Stage Timeseries
+                st.markdown("---")
+                st.subheader("Sleep Timeseries")
+                st.text("")
 
-                text = stage_summary_chart.mark_text(
-                    align='left',
-                    baseline='middle',
-                    dx=20
-                ).encode(
-                    text="Time in stage:N"
-                )
-
-                st.altair_chart((stage_summary_chart + tick + text), use_container_width=True)
-
-
-                # Sleep Stage Timeseries
-
-                ## Create a copy of the DataFrame for our time-series analysis
+                ### Create a copy of the DataFrame for our time-series analysis
                 sleep_timeseries_df = sleep_stages_df.copy()
 
                 final_interval = int(sleep_timeseries_df['seconds'].iloc[-1])
@@ -229,8 +312,46 @@ if __name__ == "__main__":
                 sleep_timeseries_df.reset_index(inplace=True)
                 sleep_timeseries_df['stages'] = sleep_timeseries_df['level'].map({'deep': 0, 'light': 1, 'rem': 2, 'wake': 3})
 
+                plot_stage_timeseries(sleep_timeseries_df)
+
+                 ### Define time range for night time heart rate analysis
+                sleep_start_time = sleep_timeseries_df['dateTime'].iloc[0]
+                sleep_end_time = sleep_timeseries_df['dateTime'].iloc[-1]
+
 
         # HEART RATE
         st.header("Heart Rate")
         with st.beta_expander("", expanded=False):
-            pass
+
+            heart_data = get_heart_data(st.session_state.client, st.session_state.date)
+
+            heart_timeseries_data = heart_data['activities-heart-intraday']['dataset']
+
+            if len(heart_timeseries_data) == 0:
+                st.warning("No heart rate data has been recorded for this day.")
+            else:
+                heart_timeseries_df = pd.DataFrame(heart_timeseries_data)
+                
+                ## Heart Rate Summary
+                st.subheader("Heart Rate Summary")
+                st.text("")
+
+                heart_col1, heart_col2, heart_col3 = st.beta_columns(3)
+
+                resting_rate = heart_data['activities-heart'][0]['value']['restingHeartRate']
+
+                with heart_col1:
+                    st.markdown(f"![Resting](https://img.icons8.com/dotty/48/000000/pulse.png) **Resting Rate:** {resting_rate}")
+                with heart_col2:
+                    st.markdown(f"![Minimum](https://img.icons8.com/ios/48/000000/minimum-value--v1.png)**Daily Minimum:** {0}")
+                with heart_col3:
+                    st.markdown(f"![Maximum](https://img.icons8.com/ios/48/000000/maximum-value--v1.png) **Daily Maximum:** {0}")
+
+                ## Heart Rate Timeseries
+                st.markdown("---")
+                st.subheader("Heart Rate Timeseries")
+                st.text("")  
+
+                
+
+                plot_heart_timeseries(heart_timeseries_df)
